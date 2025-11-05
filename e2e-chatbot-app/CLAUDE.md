@@ -39,17 +39,21 @@ e2e-chatbot-app/
 
 The main Streamlit application that:
 
+- Imports `mlflow` for client-side tracing
 - Detects endpoint type automatically (`chat/completions`, `agent/v2/chat`, or `agent/v1/responses`)
 - Maintains chat history in `st.session_state.history`
 - Renders user messages and assistant responses with tool calls
-- Implements streaming response handlers for each endpoint type:
-  - `query_chat_completions_endpoint_and_render()` - Foundation model endpoints
-  - `query_chat_agent_endpoint_and_render()` - ChatAgent endpoints (Agent Bricks v2)
-  - `query_responses_endpoint_and_render()` - ResponsesAgent endpoints (Agent Bricks v1)
+- Implements streaming response handlers with MLflow tracing for each endpoint type:
+  - `query_chat_completions_endpoint_and_render()` - Foundation model endpoints (wrapped with `mlflow.start_span("chat_completion")`)
+  - `query_chat_agent_endpoint_and_render()` - ChatAgent endpoints (wrapped with `mlflow.start_span("chat_agent")`)
+  - `query_responses_endpoint_and_render()` - ResponsesAgent endpoints (wrapped with `mlflow.start_span("responses_agent")`)
+- Extracts trace_id using `mlflow.get_current_active_span().trace_id` after streaming completes
 - Handles streaming errors with automatic fallback to non-streaming queries
 - Uses `reduce_chat_agent_chunks()` to accumulate streaming deltas
 
 **Important patterns:**
+- All streaming handlers wrap endpoint calls with `mlflow.start_span()` for tracing
+- Trace ID is extracted from active span using `mlflow.get_current_active_span().trace_id`
 - Message rendering is delegated to `Message.render()` methods
 - All history elements are `Message` objects (UserMessage or AssistantResponse)
 - Tool calls are accumulated properly with call_id mapping
@@ -77,7 +81,7 @@ Utilities for querying Databricks serving endpoints.
 
 - `_get_endpoint_task_type(endpoint_name)` - Returns endpoint type (`chat/completions`, `agent/v2/chat`, `agent/v1/responses`)
 - `query_endpoint_stream(endpoint_name, messages, return_traces)` - Routes to appropriate streaming handler
-- `query_endpoint(endpoint_name, messages, return_traces)` - Non-streaming query returning (messages, trace_id)
+- `query_endpoint(endpoint_name, messages, return_traces)` - **Wrapped with `@mlflow.trace`**, calls endpoint and extracts trace_id from active span
 - `_convert_to_responses_format(messages)` - Converts chat messages to ResponsesAgent API format
 - `submit_feedback(trace_id, is_correct, user_id, comment, endpoint)` - Logs user feedback using MLflow tracing API
 - `endpoint_supports_feedback(endpoint_name)` - Returns True (feedback always supported with tracing)
@@ -85,10 +89,11 @@ Utilities for querying Databricks serving endpoints.
 **Important details:**
 
 - Uses `get_deploy_client("databricks")` from MLflow for endpoint queries
+- Uses `@mlflow.trace` decorator on `query_endpoint()` for automatic tracing
+- Extracts trace_id using `mlflow.get_current_active_span().trace_id` after endpoint call
 - Uses `mlflow.log_feedback()` for logging user feedback to traces
 - Uses `AssessmentSource` and `AssessmentSourceType` from MLflow entities for feedback metadata
 - Streaming uses `predict_stream()`, non-streaming uses `predict()`
-- Extracts `databricks_request_id` from `databricks_output` and uses it as `trace_id` for feedback
 
 ### app.yaml
 
@@ -298,16 +303,48 @@ When an agent uses tools, the app displays:
 
 The application uses **MLflow Tracing API** for collecting user feedback following Databricks best practices:
 
+**Client-side tracing approach:**
+- All conversation turns are wrapped with `mlflow.start_span()` to create client-side traces
+- The trace_id is extracted using `mlflow.get_current_active_span().trace_id`
+- This provides end-to-end observability of the entire conversation flow
+- Feedback is logged to the client-side trace for better correlation
+
 **Feedback collection flow:**
-1. User submits thumbs up/down via Streamlit feedback widget
-2. Streamlit rating (0/1) is converted to boolean (False/True)
-3. `submit_feedback()` is called with the trace_id
-4. Feedback is logged as MLflow assessment using `mlflow.log_feedback()`
+1. Streaming handler wraps endpoint call with `mlflow.start_span()`
+2. After response is received, extract trace_id from active span
+3. User submits thumbs up/down via Streamlit feedback widget
+4. Streamlit rating (0/1) is converted to boolean (False/True)
+5. `submit_feedback()` is called with the trace_id
+6. Feedback is logged as MLflow assessment using `mlflow.log_feedback()`
+
+**MLflow tracing implementation:**
+```python
+# In streaming handlers (app.py)
+with mlflow.start_span(name="chat_completion") as span:
+    # Process streaming response
+    for chunk in query_endpoint_stream(...):
+        # Handle chunks
+        pass
+
+    # Extract trace_id from current active span
+    trace_id = mlflow.get_current_active_span().trace_id
+    return AssistantResponse(messages=messages, trace_id=trace_id)
+
+# In non-streaming handlers (model_serving_utils.py)
+@mlflow.trace
+def query_endpoint(endpoint_name, messages, return_traces):
+    # Query the endpoint
+    result_messages, _ = _query_chat_endpoint(...)
+
+    # Extract trace_id from current active span
+    trace_id = mlflow.get_current_active_span().trace_id
+    return result_messages, trace_id
+```
 
 **Function signature:**
 ```python
 submit_feedback(
-    trace_id: str,              # MLflow trace ID from databricks_request_id
+    trace_id: str,              # MLflow trace ID from get_current_active_span().trace_id
     is_correct: bool,           # True for thumbs up, False for thumbs down
     user_id: Optional[str],     # Optional user identifier
     comment: Optional[str],     # Optional free-text comment
@@ -322,13 +359,16 @@ submit_feedback(
 - `rationale`: User comment or default description
 
 **Key advantages:**
+- Uses `mlflow.get_current_active_span().trace_id` as recommended in Databricks docs
+- Client-side tracing provides end-to-end observability of conversation flow
 - Follows FastAPI reference pattern from Databricks documentation
 - No need for special "feedback" served entity in endpoint configuration
-- Feedback automatically linked to traces for observability
+- Feedback automatically linked to client-side traces for better correlation
 - Compatible with MLflow Tracing UI for viewing feedback alongside traces
 - Enables building evaluation datasets from production feedback
 - Supports optional user_id for tracking feedback sources
 - Extensible with comment/rationale field for detailed feedback
+- Traces capture full context including streaming behavior
 
 ### Chat History Management
 

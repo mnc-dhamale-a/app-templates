@@ -1,10 +1,11 @@
 import logging
 import os
 import streamlit as st
+import mlflow
 from model_serving_utils import (
-    endpoint_supports_feedback, 
-    query_endpoint, 
-    query_endpoint_stream, 
+    endpoint_supports_feedback,
+    query_endpoint,
+    query_endpoint_stream,
     _get_endpoint_task_type,
 )
 from collections import OrderedDict
@@ -113,53 +114,51 @@ def query_endpoint_and_render(task_type, input_messages):
 
 
 def query_chat_completions_endpoint_and_render(input_messages):
-    """Handle ChatCompletions streaming format."""
+    """Handle ChatCompletions streaming format with MLflow tracing."""
     with st.chat_message("assistant"):
         response_area = st.empty()
         response_area.markdown("_Thinking..._")
 
         accumulated_content = ""
-        trace_id = None
 
-        try:
-            for chunk in query_endpoint_stream(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            ):
-                if "choices" in chunk and chunk["choices"]:
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        accumulated_content += content
-                        response_area.markdown(accumulated_content)
+        # Start MLflow trace for this conversation turn
+        with mlflow.start_span(name="chat_completion") as span:
+            try:
+                for chunk in query_endpoint_stream(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                ):
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            accumulated_content += content
+                            response_area.markdown(accumulated_content)
 
-                # Extract trace_id from databricks_request_id for feedback logging
-                if "databricks_output" in chunk:
-                    req_id = chunk["databricks_output"].get("databricks_request_id")
-                    if req_id:
-                        trace_id = req_id
+                # Get trace_id from current active span
+                trace_id = mlflow.get_current_active_span().trace_id
 
-            return AssistantResponse(
-                messages=[{"role": "assistant", "content": accumulated_content}],
-                trace_id=trace_id
-            )
-        except Exception:
-            response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, trace_id = query_endpoint(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            )
-            response_area.empty()
-            with response_area.container():
-                for message in messages:
-                    render_message(message)
-            return AssistantResponse(messages=messages, trace_id=trace_id)
+                return AssistantResponse(
+                    messages=[{"role": "assistant", "content": accumulated_content}],
+                    trace_id=trace_id
+                )
+            except Exception:
+                response_area.markdown("_Ran into an error. Retrying without streaming..._")
+                messages, trace_id = query_endpoint(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                )
+                response_area.empty()
+                with response_area.container():
+                    for message in messages:
+                        render_message(message)
+                return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 def query_chat_agent_endpoint_and_render(input_messages):
-    """Handle ChatAgent streaming format."""
+    """Handle ChatAgent streaming format with MLflow tracing."""
     from mlflow.types.agent import ChatAgentChunk
 
     with st.chat_message("assistant"):
@@ -167,60 +166,60 @@ def query_chat_agent_endpoint_and_render(input_messages):
         response_area.markdown("_Thinking..._")
 
         message_buffers = OrderedDict()
-        trace_id = None
 
-        try:
-            for raw_chunk in query_endpoint_stream(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            ):
+        # Start MLflow trace for this conversation turn
+        with mlflow.start_span(name="chat_agent") as span:
+            try:
+                for raw_chunk in query_endpoint_stream(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                ):
+                    response_area.empty()
+                    chunk = ChatAgentChunk.model_validate(raw_chunk)
+                    delta = chunk.delta
+                    message_id = delta.id
+
+                    if message_id not in message_buffers:
+                        message_buffers[message_id] = {
+                            "chunks": [],
+                            "render_area": st.empty(),
+                        }
+                    message_buffers[message_id]["chunks"].append(chunk)
+
+                    partial_message = reduce_chat_agent_chunks(message_buffers[message_id]["chunks"])
+                    render_area = message_buffers[message_id]["render_area"]
+                    message_content = partial_message.model_dump_compat(exclude_none=True)
+                    with render_area.container():
+                        render_message(message_content)
+
+                messages = []
+                for msg_id, msg_info in message_buffers.items():
+                    messages.append(reduce_chat_agent_chunks(msg_info["chunks"]))
+
+                # Get trace_id from current active span
+                trace_id = mlflow.get_current_active_span().trace_id
+
+                return AssistantResponse(
+                    messages=[message.model_dump_compat(exclude_none=True) for message in messages],
+                    trace_id=trace_id
+                )
+            except Exception:
+                response_area.markdown("_Ran into an error. Retrying without streaming..._")
+                messages, trace_id = query_endpoint(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                )
                 response_area.empty()
-                chunk = ChatAgentChunk.model_validate(raw_chunk)
-                delta = chunk.delta
-                message_id = delta.id
-
-                # Extract trace_id from databricks_request_id for feedback logging
-                req_id = raw_chunk.get("databricks_output", {}).get("databricks_request_id")
-                if req_id:
-                    trace_id = req_id
-                if message_id not in message_buffers:
-                    message_buffers[message_id] = {
-                        "chunks": [],
-                        "render_area": st.empty(),
-                    }
-                message_buffers[message_id]["chunks"].append(chunk)
-
-                partial_message = reduce_chat_agent_chunks(message_buffers[message_id]["chunks"])
-                render_area = message_buffers[message_id]["render_area"]
-                message_content = partial_message.model_dump_compat(exclude_none=True)
-                with render_area.container():
-                    render_message(message_content)
-
-            messages = []
-            for msg_id, msg_info in message_buffers.items():
-                messages.append(reduce_chat_agent_chunks(msg_info["chunks"]))
-
-            return AssistantResponse(
-                messages=[message.model_dump_compat(exclude_none=True) for message in messages],
-                trace_id=trace_id
-            )
-        except Exception:
-            response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, trace_id = query_endpoint(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            )
-            response_area.empty()
-            with response_area.container():
-                for message in messages:
-                    render_message(message)
-            return AssistantResponse(messages=messages, trace_id=trace_id)
+                with response_area.container():
+                    for message in messages:
+                        render_message(message)
+                return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 def query_responses_endpoint_and_render(input_messages):
-    """Handle ResponsesAgent streaming format using MLflow types."""
+    """Handle ResponsesAgent streaming format with MLflow tracing."""
     from mlflow.types.responses import ResponsesAgentStreamEvent
 
     with st.chat_message("assistant"):
@@ -229,90 +228,88 @@ def query_responses_endpoint_and_render(input_messages):
 
         # Track all the messages that need to be rendered in order
         all_messages = []
-        trace_id = None
 
-        try:
-            for raw_event in query_endpoint_stream(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            ):
-                # Extract trace_id from databricks_request_id for feedback logging
-                if "databricks_output" in raw_event:
-                    req_id = raw_event["databricks_output"].get("databricks_request_id")
-                    if req_id:
-                        trace_id = req_id
-                
-                # Parse using MLflow streaming event types, similar to ChatAgentChunk
-                if "type" in raw_event:
-                    event = ResponsesAgentStreamEvent.model_validate(raw_event)
-                    
-                    if hasattr(event, 'item') and event.item:
-                        item = event.item  # This is a dict, not a parsed object
-                        
-                        if item.get("type") == "message":
-                            # Extract text content from message if present
-                            content_parts = item.get("content", [])
-                            for content_part in content_parts:
-                                if content_part.get("type") == "output_text":
-                                    text = content_part.get("text", "")
-                                    if text:
-                                        all_messages.append({
-                                            "role": "assistant",
-                                            "content": text
-                                        })
-                            
-                        elif item.get("type") == "function_call":
-                            # Tool call
-                            call_id = item.get("call_id")
-                            function_name = item.get("name")
-                            arguments = item.get("arguments", "")
-                            
-                            # Add to messages for history
-                            all_messages.append({
-                                "role": "assistant",
-                                "content": "",
-                                "tool_calls": [{
-                                    "id": call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": function_name,
-                                        "arguments": arguments
-                                    }
-                                }]
-                            })
-                            
-                        elif item.get("type") == "function_call_output":
-                            # Tool call output/result
-                            call_id = item.get("call_id")
-                            output = item.get("output", "")
-                            
-                            # Add to messages for history
-                            all_messages.append({
-                                "role": "tool",
-                                "content": output,
-                                "tool_call_id": call_id
-                            })
-                
-                # Update the display by rendering all accumulated messages
-                if all_messages:
-                    with response_area.container():
-                        for msg in all_messages:
-                            render_message(msg)
+        # Start MLflow trace for this conversation turn
+        with mlflow.start_span(name="responses_agent") as span:
+            try:
+                for raw_event in query_endpoint_stream(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                ):
+                    # Parse using MLflow streaming event types, similar to ChatAgentChunk
+                    if "type" in raw_event:
+                        event = ResponsesAgentStreamEvent.model_validate(raw_event)
 
-            return AssistantResponse(messages=all_messages, trace_id=trace_id)
-        except Exception:
-            response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, trace_id = query_endpoint(
-                endpoint_name=SERVING_ENDPOINT,
-                messages=input_messages,
-                return_traces=ENDPOINT_SUPPORTS_FEEDBACK
-            )
-            response_area.empty()
-            with response_area.container():
-                for message in messages:
-                    render_message(message)
-            return AssistantResponse(messages=messages, trace_id=trace_id)
+                        if hasattr(event, 'item') and event.item:
+                            item = event.item  # This is a dict, not a parsed object
+
+                            if item.get("type") == "message":
+                                # Extract text content from message if present
+                                content_parts = item.get("content", [])
+                                for content_part in content_parts:
+                                    if content_part.get("type") == "output_text":
+                                        text = content_part.get("text", "")
+                                        if text:
+                                            all_messages.append({
+                                                "role": "assistant",
+                                                "content": text
+                                            })
+
+                            elif item.get("type") == "function_call":
+                                # Tool call
+                                call_id = item.get("call_id")
+                                function_name = item.get("name")
+                                arguments = item.get("arguments", "")
+
+                                # Add to messages for history
+                                all_messages.append({
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": function_name,
+                                            "arguments": arguments
+                                        }
+                                    }]
+                                })
+
+                            elif item.get("type") == "function_call_output":
+                                # Tool call output/result
+                                call_id = item.get("call_id")
+                                output = item.get("output", "")
+
+                                # Add to messages for history
+                                all_messages.append({
+                                    "role": "tool",
+                                    "content": output,
+                                    "tool_call_id": call_id
+                                })
+
+                    # Update the display by rendering all accumulated messages
+                    if all_messages:
+                        with response_area.container():
+                            for msg in all_messages:
+                                render_message(msg)
+
+                # Get trace_id from current active span
+                trace_id = mlflow.get_current_active_span().trace_id
+
+                return AssistantResponse(messages=all_messages, trace_id=trace_id)
+            except Exception:
+                response_area.markdown("_Ran into an error. Retrying without streaming..._")
+                messages, trace_id = query_endpoint(
+                    endpoint_name=SERVING_ENDPOINT,
+                    messages=input_messages,
+                    return_traces=ENDPOINT_SUPPORTS_FEEDBACK
+                )
+                response_area.empty()
+                with response_area.container():
+                    for message in messages:
+                        render_message(message)
+                return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 

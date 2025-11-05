@@ -114,12 +114,13 @@ def _query_responses_endpoint_stream(endpoint_name: str, messages: list[dict[str
         # Just yield the raw event data, let app.py handle the parsing
         yield event_data
 
+@mlflow.trace
 def query_endpoint(endpoint_name, messages, return_traces):
     """
     Query an endpoint, returning the messages and trace ID for feedback.
 
-    The trace_id comes from databricks_request_id in the response, which is
-    the MLflow trace ID used for logging feedback and observability.
+    This function is wrapped with @mlflow.trace to create a client-side trace.
+    The trace_id is extracted from the current active span for feedback logging.
 
     Returns:
         tuple: (messages list, trace_id string)
@@ -127,9 +128,14 @@ def query_endpoint(endpoint_name, messages, return_traces):
     task_type = _get_endpoint_task_type(endpoint_name)
 
     if task_type == "agent/v1/responses":
-        return _query_responses_endpoint(endpoint_name, messages, return_traces)
+        result_messages, _ = _query_responses_endpoint(endpoint_name, messages, return_traces)
     else:
-        return _query_chat_endpoint(endpoint_name, messages, return_traces)
+        result_messages, _ = _query_chat_endpoint(endpoint_name, messages, return_traces)
+
+    # Get trace_id from current active span (client-side trace)
+    trace_id = mlflow.get_current_active_span().trace_id
+
+    return result_messages, trace_id
 
 def _query_chat_endpoint(endpoint_name, messages, return_traces):
     """
