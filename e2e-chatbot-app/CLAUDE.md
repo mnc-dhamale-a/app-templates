@@ -79,15 +79,16 @@ Utilities for querying Databricks serving endpoints.
 - `query_endpoint_stream(endpoint_name, messages, return_traces)` - Routes to appropriate streaming handler
 - `query_endpoint(endpoint_name, messages, return_traces)` - Non-streaming query with fallback
 - `_convert_to_responses_format(messages)` - Converts chat messages to ResponsesAgent API format
-- `submit_feedback(endpoint, request_id, rating)` - Submits thumbs up/down feedback
-- `endpoint_supports_feedback(endpoint_name)` - Checks if endpoint has feedback entity configured
+- `submit_feedback(endpoint, request_id, rating)` - Logs thumbs up/down feedback using MLflow tracing API
+- `endpoint_supports_feedback(endpoint_name)` - Returns True (feedback always supported with tracing)
 
 **Important details:**
 
 - Uses `get_deploy_client("databricks")` from MLflow for endpoint queries
-- Uses `WorkspaceClient()` from Databricks SDK for metadata and feedback
+- Uses `mlflow.log_feedback()` for logging user feedback to traces
+- Uses `AssessmentSource` and `AssessmentSourceType` from MLflow entities for feedback metadata
 - Streaming uses `predict_stream()`, non-streaming uses `predict()`
-- Extracts `databricks_request_id` from `databricks_output` for feedback tracking
+- Extracts `databricks_request_id` from `databricks_output` and uses it as `trace_id` for feedback
 
 ### app.yaml
 
@@ -295,12 +296,22 @@ When an agent uses tools, the app displays:
 
 ### Feedback Support
 
-If the endpoint has a feedback entity configured:
+The application uses **MLflow Tracing API** for collecting user feedback:
 
 - Thumbs up/down UI appears below assistant messages
-- Feedback is submitted via `/serving-endpoints/{endpoint}/served-models/feedback/invocations`
-- Uses `request_id` from `databricks_output.databricks_request_id`
-- Source is marked as `{"id": "e2e-chatbot-app", "type": "human"}`
+- Feedback is logged using `mlflow.log_feedback()` API
+- Uses `databricks_request_id` from endpoint responses as the `trace_id`
+- Feedback is stored as MLflow assessments on traces with:
+  - `name`: "user_rating"
+  - `value`: Boolean (True for thumbs up, False for thumbs down)
+  - `source`: AssessmentSource with `source_type=HUMAN` and `source_id="e2e-chatbot-app"`
+  - `rationale`: Human-readable feedback description
+
+**Key advantages of MLflow tracing feedback:**
+- No need for special "feedback" served entity in endpoint configuration
+- Feedback is automatically linked to traces for observability
+- Compatible with MLflow Tracing UI for viewing feedback alongside traces
+- Enables building evaluation datasets from production feedback
 
 ### Chat History Management
 
@@ -417,14 +428,16 @@ If the endpoint has a feedback entity configured:
 - Check MLflow logs for detailed error messages
 - Verify endpoint health in Databricks UI
 
-### Feedback not appearing
+### Feedback not appearing or failing to submit
 
-**Cause:** Endpoint doesn't have feedback entity configured
+**Cause:** Tracing not enabled or trace_id not being captured
 
 **Solution:**
-- Check `endpoint_supports_feedback()` returns `True`
-- Add feedback configuration to endpoint served entities
-- Redeploy endpoint with feedback support
+- Verify `return_trace=True` is set in `databricks_options` (already enabled in code)
+- Check that `databricks_request_id` is being returned in endpoint responses
+- Ensure MLflow is properly installed with tracing support: `mlflow>=2.21.2`
+- Verify network connectivity and permissions for MLflow tracing backend
+- Check application logs for feedback submission errors
 
 ## File Locations Reference
 
@@ -439,15 +452,18 @@ If the endpoint has a feedback entity configured:
 - `messages.py:43-59` - AssistantResponse class
 - `messages.py:62-77` - `render_message()` function
 - `messages.py:80-95` - Feedback UI fragment
+- `model_serving_utils.py:1-4` - MLflow tracing imports (AssessmentSource, AssessmentSourceType)
 - `model_serving_utils.py:14-21` - `_get_endpoint_task_type()`
 - `model_serving_utils.py:68-74` - Main streaming router
-- `model_serving_utils.py:233-261` - `submit_feedback()`
-- `model_serving_utils.py:264-268` - `endpoint_supports_feedback()`
+- `model_serving_utils.py:235-274` - `submit_feedback()` using MLflow tracing API
+- `model_serving_utils.py:277-293` - `endpoint_supports_feedback()` (always returns True with tracing)
 
 ## Additional Resources
 
 - [Databricks Agent Framework Docs](https://docs.databricks.com/aws/en/generative-ai/agent-framework/chat-app)
 - [Databricks Apps Documentation](https://docs.databricks.com/aws/en/dev-tools/bundles/apps-tutorial)
+- [MLflow Tracing - GenAI Observability](https://docs.databricks.com/aws/en/mlflow3/genai/tracing)
+- [Collect User Feedback with MLflow Tracing](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/collect-user-feedback/)
 - [Streamlit Documentation](https://docs.streamlit.io/)
 - [MLflow Deployment Client](https://mlflow.org/docs/latest/python_api/mlflow.deployments.html)
 - [Databricks SDK for Python](https://docs.databricks.com/en/dev-tools/sdk-python.html)

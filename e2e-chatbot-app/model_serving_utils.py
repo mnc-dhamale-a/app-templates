@@ -1,5 +1,7 @@
 from mlflow.deployments import get_deploy_client
 from databricks.sdk import WorkspaceClient
+import mlflow
+from mlflow.entities import AssessmentSource, AssessmentSourceType
 import json
 import uuid
 
@@ -231,37 +233,61 @@ def _query_responses_endpoint(endpoint_name, messages, return_traces):
     return result_messages or [{"role": "assistant", "content": "No response found"}], request_id
 
 def submit_feedback(endpoint, request_id, rating):
-    """Submit feedback to the agent."""
-    rating_string = "positive" if rating == 1 else "negative"
-    text_assessments = [] if rating is None else [{
-        "ratings": {
-            "answer_correct": {"value": rating_string},
-        },
-        "free_text_comment": None
-    }]
+    """
+    Submit user feedback using MLflow tracing API.
 
-    proxy_payload = {
-        "dataframe_records": [
-            {
-                "source": json.dumps({
-                    "id": "e2e-chatbot-app",  # Or extract from auth
-                    "type": "human"
-                }),
-                "request_id": request_id,
-                "text_assessments": json.dumps(text_assessments),
-                "retrieval_assessments": json.dumps([]),
-            }
-        ]
-    }
-    w = WorkspaceClient()
-    return w.api_client.do(
-        method='POST',
-        path=f"/serving-endpoints/{endpoint}/served-models/feedback/invocations",
-        body=proxy_payload,
+    Args:
+        endpoint: The serving endpoint name (kept for backward compatibility)
+        request_id: The databricks_request_id which maps to trace_id
+        rating: Thumbs up (1) or thumbs down (0)
+
+    Returns:
+        The logged feedback assessment
+    """
+    if rating is None:
+        return None
+
+    # Convert rating to boolean: thumbs up (1) = True, thumbs down (0) = False
+    feedback_value = rating == 1
+    rating_string = "positive" if rating == 1 else "negative"
+
+    # Create assessment source to track that this is human feedback
+    source = AssessmentSource(
+        source_type=AssessmentSourceType.HUMAN,
+        source_id="e2e-chatbot-app"
     )
+
+    try:
+        # Log feedback using MLflow tracing API
+        # The databricks_request_id from serving endpoints corresponds to the trace_id
+        feedback_assessment = mlflow.log_feedback(
+            trace_id=request_id,
+            name="user_rating",
+            value=feedback_value,
+            source=source,
+            rationale=f"User provided {rating_string} feedback"
+        )
+        logging.info(f"Successfully logged feedback for trace {request_id}: {rating_string}")
+        return feedback_assessment
+    except Exception as e:
+        logging.error(f"Failed to log feedback for trace {request_id}: {e}")
+        raise
 
 
 def endpoint_supports_feedback(endpoint_name):
-    w = WorkspaceClient()
-    endpoint = w.serving_endpoints.get(endpoint_name)
-    return "feedback" in [entity.name for entity in endpoint.config.served_entities]
+    """
+    Check if the endpoint supports feedback.
+
+    With MLflow tracing API, feedback is always supported when tracing is enabled.
+    This function now always returns True since we enable tracing with return_trace=True.
+
+    The legacy feedback endpoint API required a special "feedback" served entity,
+    but the modern MLflow tracing API logs feedback directly to traces.
+
+    Args:
+        endpoint_name: The serving endpoint name (kept for backward compatibility)
+
+    Returns:
+        True - feedback is always supported with MLflow tracing
+    """
+    return True
