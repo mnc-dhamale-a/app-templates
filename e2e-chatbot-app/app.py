@@ -117,10 +117,10 @@ def query_chat_completions_endpoint_and_render(input_messages):
     with st.chat_message("assistant"):
         response_area = st.empty()
         response_area.markdown("_Thinking..._")
-        
+
         accumulated_content = ""
-        request_id = None
-        
+        trace_id = None
+
         try:
             for chunk in query_endpoint_stream(
                 endpoint_name=SERVING_ENDPOINT,
@@ -133,19 +133,20 @@ def query_chat_completions_endpoint_and_render(input_messages):
                     if content:
                         accumulated_content += content
                         response_area.markdown(accumulated_content)
-                
+
+                # Extract trace_id from databricks_request_id for feedback logging
                 if "databricks_output" in chunk:
                     req_id = chunk["databricks_output"].get("databricks_request_id")
                     if req_id:
-                        request_id = req_id
-            
+                        trace_id = req_id
+
             return AssistantResponse(
                 messages=[{"role": "assistant", "content": accumulated_content}],
-                request_id=request_id
+                trace_id=trace_id
             )
         except Exception:
             response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, request_id = query_endpoint(
+            messages, trace_id = query_endpoint(
                 endpoint_name=SERVING_ENDPOINT,
                 messages=input_messages,
                 return_traces=ENDPOINT_SUPPORTS_FEEDBACK
@@ -154,20 +155,20 @@ def query_chat_completions_endpoint_and_render(input_messages):
             with response_area.container():
                 for message in messages:
                     render_message(message)
-            return AssistantResponse(messages=messages, request_id=request_id)
+            return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 def query_chat_agent_endpoint_and_render(input_messages):
     """Handle ChatAgent streaming format."""
     from mlflow.types.agent import ChatAgentChunk
-    
+
     with st.chat_message("assistant"):
         response_area = st.empty()
         response_area.markdown("_Thinking..._")
-        
+
         message_buffers = OrderedDict()
-        request_id = None
-        
+        trace_id = None
+
         try:
             for raw_chunk in query_endpoint_stream(
                 endpoint_name=SERVING_ENDPOINT,
@@ -179,33 +180,34 @@ def query_chat_agent_endpoint_and_render(input_messages):
                 delta = chunk.delta
                 message_id = delta.id
 
+                # Extract trace_id from databricks_request_id for feedback logging
                 req_id = raw_chunk.get("databricks_output", {}).get("databricks_request_id")
                 if req_id:
-                    request_id = req_id
+                    trace_id = req_id
                 if message_id not in message_buffers:
                     message_buffers[message_id] = {
                         "chunks": [],
                         "render_area": st.empty(),
                     }
                 message_buffers[message_id]["chunks"].append(chunk)
-                
+
                 partial_message = reduce_chat_agent_chunks(message_buffers[message_id]["chunks"])
                 render_area = message_buffers[message_id]["render_area"]
                 message_content = partial_message.model_dump_compat(exclude_none=True)
                 with render_area.container():
                     render_message(message_content)
-            
+
             messages = []
             for msg_id, msg_info in message_buffers.items():
                 messages.append(reduce_chat_agent_chunks(msg_info["chunks"]))
-            
+
             return AssistantResponse(
                 messages=[message.model_dump_compat(exclude_none=True) for message in messages],
-                request_id=request_id
+                trace_id=trace_id
             )
         except Exception:
             response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, request_id = query_endpoint(
+            messages, trace_id = query_endpoint(
                 endpoint_name=SERVING_ENDPOINT,
                 messages=input_messages,
                 return_traces=ENDPOINT_SUPPORTS_FEEDBACK
@@ -214,20 +216,20 @@ def query_chat_agent_endpoint_and_render(input_messages):
             with response_area.container():
                 for message in messages:
                     render_message(message)
-            return AssistantResponse(messages=messages, request_id=request_id)
+            return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 def query_responses_endpoint_and_render(input_messages):
     """Handle ResponsesAgent streaming format using MLflow types."""
     from mlflow.types.responses import ResponsesAgentStreamEvent
-    
+
     with st.chat_message("assistant"):
         response_area = st.empty()
         response_area.markdown("_Thinking..._")
-        
+
         # Track all the messages that need to be rendered in order
         all_messages = []
-        request_id = None
+        trace_id = None
 
         try:
             for raw_event in query_endpoint_stream(
@@ -235,11 +237,11 @@ def query_responses_endpoint_and_render(input_messages):
                 messages=input_messages,
                 return_traces=ENDPOINT_SUPPORTS_FEEDBACK
             ):
-                # Extract databricks_output for request_id
+                # Extract trace_id from databricks_request_id for feedback logging
                 if "databricks_output" in raw_event:
                     req_id = raw_event["databricks_output"].get("databricks_request_id")
                     if req_id:
-                        request_id = req_id
+                        trace_id = req_id
                 
                 # Parse using MLflow streaming event types, similar to ChatAgentChunk
                 if "type" in raw_event:
@@ -298,10 +300,10 @@ def query_responses_endpoint_and_render(input_messages):
                         for msg in all_messages:
                             render_message(msg)
 
-            return AssistantResponse(messages=all_messages, request_id=request_id)
+            return AssistantResponse(messages=all_messages, trace_id=trace_id)
         except Exception:
             response_area.markdown("_Ran into an error. Retrying without streaming..._")
-            messages, request_id = query_endpoint(
+            messages, trace_id = query_endpoint(
                 endpoint_name=SERVING_ENDPOINT,
                 messages=input_messages,
                 return_traces=ENDPOINT_SUPPORTS_FEEDBACK
@@ -310,7 +312,7 @@ def query_responses_endpoint_and_render(input_messages):
             with response_area.container():
                 for message in messages:
                     render_message(message)
-            return AssistantResponse(messages=messages, request_id=request_id)
+            return AssistantResponse(messages=messages, trace_id=trace_id)
 
 
 

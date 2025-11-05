@@ -4,6 +4,7 @@ import mlflow
 from mlflow.entities import AssessmentSource, AssessmentSourceType
 import json
 import uuid
+from typing import Optional
 
 import logging
 
@@ -115,33 +116,45 @@ def _query_responses_endpoint_stream(endpoint_name: str, messages: list[dict[str
 
 def query_endpoint(endpoint_name, messages, return_traces):
     """
-    Query an endpoint, returning the string message content and request
-    ID for feedback
+    Query an endpoint, returning the messages and trace ID for feedback.
+
+    The trace_id comes from databricks_request_id in the response, which is
+    the MLflow trace ID used for logging feedback and observability.
+
+    Returns:
+        tuple: (messages list, trace_id string)
     """
     task_type = _get_endpoint_task_type(endpoint_name)
-    
+
     if task_type == "agent/v1/responses":
         return _query_responses_endpoint(endpoint_name, messages, return_traces)
     else:
         return _query_chat_endpoint(endpoint_name, messages, return_traces)
 
 def _query_chat_endpoint(endpoint_name, messages, return_traces):
-    """Calls a model serving endpoint with chat/completions format."""
+    """
+    Calls a model serving endpoint with chat/completions format.
+
+    Returns:
+        tuple: (messages list, trace_id string) - trace_id is the databricks_request_id
+    """
     inputs = {'messages': messages}
     if return_traces:
         inputs['databricks_options'] = {'return_trace': True}
-    
+
     res = get_deploy_client('databricks').predict(
         endpoint=endpoint_name,
         inputs=inputs,
     )
-    request_id = res.get("databricks_output", {}).get("databricks_request_id")
+    # Extract trace_id from databricks_request_id - this is the MLflow trace ID
+    trace_id = res.get("databricks_output", {}).get("databricks_request_id")
+
     if "messages" in res:
-        return res["messages"], request_id
+        return res["messages"], trace_id
     elif "choices" in res:
         choice_message = res["choices"][0]["message"]
         choice_content = choice_message.get("content")
-        
+
         # Case 1: The content is a list of structured objects
         if isinstance(choice_content, list):
             combined_content = "".join([part.get("text", "") for part in choice_content if part.get("type") == "text"])
@@ -149,20 +162,25 @@ def _query_chat_endpoint(endpoint_name, messages, return_traces):
                 "role": choice_message.get("role"),
                 "content": combined_content
             }
-            return [reformatted_message], request_id
-        
+            return [reformatted_message], trace_id
+
         # Case 2: The content is a simple string
         elif isinstance(choice_content, str):
-            return [choice_message], request_id
+            return [choice_message], trace_id
 
     _throw_unexpected_endpoint_format()
 
 def _query_responses_endpoint(endpoint_name, messages, return_traces):
-    """Query agent/v1/responses endpoints using MLflow deployments client."""
+    """
+    Query agent/v1/responses endpoints using MLflow deployments client.
+
+    Returns:
+        tuple: (messages list, trace_id string) - trace_id is the databricks_request_id
+    """
     client = get_deploy_client("databricks")
-    
+
     input_messages = _convert_to_responses_format(messages)
-    
+
     # Prepare input payload for ResponsesAgent
     inputs = {
         "input": input_messages,
@@ -170,13 +188,14 @@ def _query_responses_endpoint(endpoint_name, messages, return_traces):
     }
     if return_traces:
         inputs["databricks_options"] = {"return_trace": True}
-    
+
     # Make the prediction call
     response = client.predict(endpoint=endpoint_name, inputs=inputs)
-    
+
     # Extract messages from the response
     result_messages = []
-    request_id = response.get("databricks_output", {}).get("databricks_request_id")
+    # Extract trace_id from databricks_request_id - this is the MLflow trace ID
+    trace_id = response.get("databricks_output", {}).get("databricks_request_id")
     
     # Process the output items from ResponsesAgent response
     output_items = response.get("output", [])
@@ -230,47 +249,69 @@ def _query_responses_endpoint(endpoint_name, messages, return_traces):
                 "tool_call_id": call_id
             })
     
-    return result_messages or [{"role": "assistant", "content": "No response found"}], request_id
+    return result_messages or [{"role": "assistant", "content": "No response found"}], trace_id
 
-def submit_feedback(endpoint, request_id, rating):
+def submit_feedback(
+    trace_id: str,
+    is_correct: bool,
+    user_id: Optional[str] = None,
+    comment: Optional[str] = None,
+    endpoint: Optional[str] = None
+):
     """
     Submit user feedback using MLflow tracing API.
 
+    This follows the Databricks recommended pattern for collecting user feedback
+    on GenAI application traces for observability and evaluation.
+
     Args:
-        endpoint: The serving endpoint name (kept for backward compatibility)
-        request_id: The databricks_request_id which maps to trace_id
-        rating: Thumbs up (1) or thumbs down (0)
+        trace_id: The MLflow trace ID (from databricks_request_id in endpoint responses)
+        is_correct: True for thumbs up, False for thumbs down
+        user_id: Optional user identifier for tracking feedback source
+        comment: Optional free-text comment/rationale from user
+        endpoint: Optional endpoint name (kept for backward compatibility, not used)
 
     Returns:
-        The logged feedback assessment
-    """
-    if rating is None:
-        return None
+        The logged feedback assessment from MLflow
 
-    # Convert rating to boolean: thumbs up (1) = True, thumbs down (0) = False
-    feedback_value = rating == 1
-    rating_string = "positive" if rating == 1 else "negative"
+    Raises:
+        Exception: If feedback logging fails
+
+    Example:
+        >>> submit_feedback(
+        ...     trace_id="tr-1234567890abcdef",
+        ...     is_correct=True,
+        ...     user_id="user@example.com"
+        ... )
+    """
+    if trace_id is None:
+        logging.warning("No trace_id provided, skipping feedback submission")
+        return None
 
     # Create assessment source to track that this is human feedback
     source = AssessmentSource(
         source_type=AssessmentSourceType.HUMAN,
-        source_id="e2e-chatbot-app"
+        source_id=user_id or "e2e-chatbot-app"
     )
+
+    # Generate rationale from comment or default description
+    rating_string = "positive" if is_correct else "negative"
+    rationale = comment or f"User provided {rating_string} feedback"
 
     try:
         # Log feedback using MLflow tracing API
-        # The databricks_request_id from serving endpoints corresponds to the trace_id
+        # Reference: https://docs.databricks.com/aws/en/mlflow3/genai/tracing/collect-user-feedback/
         feedback_assessment = mlflow.log_feedback(
-            trace_id=request_id,
-            name="user_rating",
-            value=feedback_value,
+            trace_id=trace_id,
+            name="user_feedback",
+            value=is_correct,
             source=source,
-            rationale=f"User provided {rating_string} feedback"
+            rationale=rationale
         )
-        logging.info(f"Successfully logged feedback for trace {request_id}: {rating_string}")
+        logging.info(f"Successfully logged feedback for trace {trace_id}: {rating_string}")
         return feedback_assessment
     except Exception as e:
-        logging.error(f"Failed to log feedback for trace {request_id}: {e}")
+        logging.error(f"Failed to log feedback for trace {trace_id}: {e}")
         raise
 
 
